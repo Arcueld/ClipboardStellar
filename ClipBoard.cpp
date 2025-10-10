@@ -11,64 +11,6 @@ static ULONG64 vtableOffset;
 
 typedef LONG(NTAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
 
-typedef struct tagGETCLIPBDATA
-{
-    UINT uFmtRet;
-    BOOL fGlobalHandle;
-    union
-    {
-        HANDLE hLocale;
-        HANDLE hPalette;
-    };
-} GETCLIPBDATA, * PGETCLIPBDATA;
-
-typedef HANDLE(NTAPI* pNtUserGetClipboardData)(
-    UINT fmt,
-    PGETCLIPBDATA pgcd
-    );
-
-typedef NTSTATUS(APIENTRY* pNtUserCreateLocalMemHandle)(
-    HANDLE 	hMem,
-    LPVOID 	pData,
-    DWORD64 cbData,
-    DWORD* pcbData
-    );
-
-
-HMODULE win32udll = LoadLibrary(L"win32u.dll");
-pNtUserGetClipboardData NtUserGetClipboardData = (pNtUserGetClipboardData)GetProcAddress(win32udll, "NtUserGetClipboardData");
-pNtUserCreateLocalMemHandle NtUserCreateLocalMemHandle = (pNtUserCreateLocalMemHandle)GetProcAddress(win32udll, "NtUserCreateLocalMemHandle");
-
-void lowVersionGetCurrentClipboradContent() {
-    OpenClipboard(NULL);
-    GETCLIPBDATA data = { 0 };
-
-    HANDLE hMem = NtUserGetClipboardData(CF_UNICODETEXT, &data);
-
-    if (data.fGlobalHandle){
-        LPVOID r3Mem = CreateLocalMemHandle(hMem);
-        CloseClipboard();
-    }
-}
-
-LPVOID CreateLocalMemHandle(HANDLE hMem) {
-    DWORD dwBytes;
-    // 先报错拿到size
-    if (NtUserCreateLocalMemHandle(hMem, NULL, 0, &dwBytes) != 0xC0000023) {
-        return 0;
-    }
-    // 分配内存
-    HGLOBAL R3Mem = GlobalAlloc(0, dwBytes);
-    if (!R3Mem) return 0;
-
-    // 将hMem复制到R3内存
-    if(NtUserCreateLocalMemHandle(hMem, R3Mem, dwBytes,0) < 0) {
-		GlobalFree(R3Mem);
-		return 0;
-	}
-
-    return R3Mem;
-}
 
 CHAR* wideToUtf8(const WCHAR* src) {
     int size = WideCharToMultiByte(65001, 0, src, -1, nullptr, 0, nullptr, nullptr);
@@ -193,10 +135,6 @@ int wmain() {
 
     vtableOffset = getVtableOffset(&version);
 
-    if (version.dwMajorVersion < 10) {
-        lowVersionGetCurrentClipboradContent();
-        return 0;
-    }
 
     DWORD pid = getSvchostPid();
     if (!pid) {
@@ -253,6 +191,5 @@ int wmain() {
     }
 
     CloseHandle(hProcess);
-    system("pause");
     return 0;
 }
