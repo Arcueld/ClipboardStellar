@@ -5,12 +5,15 @@
 #include <vector>
 #include <string>
 #include <cstring>
-
-
-static ULONG64 vtableOffset;
+#include <winnt.h>
 
 typedef LONG(NTAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
 
+struct RdataSectionInfo {
+    ULONG64 startAddr;
+    ULONG64 endAddr;
+    bool valid;
+};
 
 CHAR* wideToUtf8(const WCHAR* src) {
     int size = WideCharToMultiByte(65001, 0, src, -1, nullptr, 0, nullptr, nullptr);
@@ -32,6 +35,74 @@ void PrintRemoteUnicodeString(HANDLE hProcess, ULONG64 remotePtr) {
         std::cout << "[+] -----------------------------------\n " << utf8 << std::endl;
         free(utf8);
     }
+}
+
+RdataSectionInfo GetRdataSectionInfo(HANDLE hProcess, LPVOID dllBase) {
+    RdataSectionInfo info = { 0, 0, false };
+    
+    if (!hProcess || !dllBase) {
+        return info;
+    }
+
+    IMAGE_DOS_HEADER dosHeader = { 0 };
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(hProcess, dllBase, &dosHeader, sizeof(dosHeader), &bytesRead) ||
+        bytesRead != sizeof(dosHeader) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+        return info;
+    }
+
+    ULONG64 ntHeaderAddr = (ULONG64)dllBase + dosHeader.e_lfanew;
+    DWORD signature = 0;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)ntHeaderAddr, &signature, sizeof(signature), &bytesRead) ||
+        bytesRead != sizeof(signature) || signature != IMAGE_NT_SIGNATURE) {
+        return info;
+    }
+
+    IMAGE_FILE_HEADER fileHeader = { 0 };
+    ULONG64 fileHeaderAddr = ntHeaderAddr + sizeof(DWORD);
+    if (!ReadProcessMemory(hProcess, (LPCVOID)fileHeaderAddr, &fileHeader, sizeof(fileHeader), &bytesRead) ||
+        bytesRead != sizeof(fileHeader)) {
+        return info;
+    }
+
+    WORD numSections = fileHeader.NumberOfSections;
+    
+    ULONG64 optHeaderAddr = fileHeaderAddr + sizeof(IMAGE_FILE_HEADER);
+    WORD magic = 0;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)optHeaderAddr, &magic, sizeof(magic), &bytesRead) ||
+        bytesRead != sizeof(magic)) {
+        return info;
+    }
+
+    ULONG64 sectionHeaderAddr = 0;
+    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        sectionHeaderAddr = optHeaderAddr + sizeof(IMAGE_OPTIONAL_HEADER64);
+    }
+    else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        sectionHeaderAddr = optHeaderAddr + sizeof(IMAGE_OPTIONAL_HEADER32);
+    }
+    else {
+        return info;
+    }
+    
+    for (WORD i = 0; i < numSections; ++i) {
+        IMAGE_SECTION_HEADER sectionHeader = { 0 };
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(sectionHeaderAddr + i * sizeof(IMAGE_SECTION_HEADER)),
+                              &sectionHeader, sizeof(sectionHeader), &bytesRead) ||
+            bytesRead != sizeof(sectionHeader)) {
+            continue;
+        }
+
+        if (memcmp(sectionHeader.Name, ".rdata", 6) == 0 || 
+            memcmp(sectionHeader.Name, ".rdata\x00\x00", 8) == 0) {
+            info.startAddr = (ULONG64)dllBase + sectionHeader.VirtualAddress;
+            info.endAddr = info.startAddr + sectionHeader.Misc.VirtualSize;
+            info.valid = true;
+            return info;
+        }
+    }
+
+    return info;
 }
 
 DWORD getSvchostPid()
@@ -69,58 +140,22 @@ DWORD getSvchostPid()
     return 0;
 }
 
-ULONG64 getVtableOffset(LPOSVERSIONINFOW version) {
-    ULONG64 offset = 0;
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    auto RtlGetVersion = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
-    RtlGetVersion(version);
-
-    switch (version->dwBuildNumber) {
-    case 22000: offset = 0xAE160; break;
-    case 18362: offset = 0x910C8; break;
-    case 17134: offset = 0x7D860; break;
-    case 17763: offset = 0x92070; break;
-    case 19041:
-        offset = (version->dwPlatformId == 1) ? 0x97150 : 0x92070;
-        break;
-    case 20348: offset = 0xAE160; break;
-    case 22621:
-        switch (version->dwPlatformId) {
-        case 4541: offset = 0xB9128; break;
-        case 4249: offset = 0xB4128; break;
-        default: offset = 0xAF120; break;
-        }
-        break;
-    case 26100:
-        switch (version->dwPlatformId) {
-        case 5074: offset = 0x8EEC8; break;
-        case 3624:
-        case 2454: offset = 0x93EC8; break;
-        case 1882: offset = 0x8EEC8; break;
-        default: offset = 0x87ED0; break;
-        }
-        break;
-    default: break;
-    }
-
-    return offset;
-}
-
-LPVOID getCUnicodeTextFormatVtable(HANDLE hProcess, LPVOID* dllBase) {
+LPVOID GetDataTransferDllBase(HANDLE hProcess) {
     DWORD bytesNeeded = 0;
     HMODULE datatransferDLL = nullptr;
 
     EnumProcessModules(hProcess, nullptr, 0, &bytesNeeded);
     auto mods = (HMODULE*)malloc(bytesNeeded);
+    if (!mods) return nullptr;
+    
     if (EnumProcessModules(hProcess, mods, bytesNeeded, &bytesNeeded)) {
         for (size_t i = 0; i < bytesNeeded / sizeof(HMODULE); i++) {
             char baseName[MAX_PATH] = { 0 };
             if (K32GetModuleBaseNameA(hProcess, mods[i], baseName, MAX_PATH)) {
                 if (_stricmp(baseName, "windows.applicationmodel.datatransfer.dll") == 0) {
                     datatransferDLL = mods[i];
-                    *dllBase = datatransferDLL;
                     free(mods);
-                    return (LPVOID)((ULONG64)datatransferDLL + vtableOffset);
+                    return datatransferDLL;
                 }
             }
         }
@@ -130,12 +165,6 @@ LPVOID getCUnicodeTextFormatVtable(HANDLE hProcess, LPVOID* dllBase) {
 }
 
 int wmain() {
-
-    OSVERSIONINFOW version = { sizeof(OSVERSIONINFOW) };
-
-    vtableOffset = getVtableOffset(&version);
-
-
     DWORD pid = getSvchostPid();
     if (!pid) {
         std::cout << "[-] Failed to find cbdhsvc process" << std::endl;
@@ -148,15 +177,16 @@ int wmain() {
         return -1;
     }
 
-    LPVOID dllBase = nullptr;
-    LPVOID vtable = getCUnicodeTextFormatVtable(hProcess, &dllBase);
-    if (!vtable || !dllBase) {
-        std::cout << "[-] Failed to locate vtable or datatransfer.dll" << std::endl;
+    LPVOID dllBase = GetDataTransferDllBase(hProcess);
+    if (!dllBase) {
+        std::cout << "[-] Failed to locate datatransfer.dll" << std::endl;
         CloseHandle(hProcess);
         return -1;
     }
 
-    std::cout << "[+] vtable: 0x" << std::hex << vtable << std::endl;
+    std::cout << "[+] datatransfer.dll base: 0x" << std::hex << dllBase << std::endl;
+
+    RdataSectionInfo rdataInfo = GetRdataSectionInfo(hProcess, dllBase);
 
     MEMORY_BASIC_INFORMATION mbi = { 0 };
     LPBYTE queryBase = nullptr;
@@ -170,16 +200,29 @@ int wmain() {
         }
 
         auto buffer = (BYTE*)malloc(mbi.RegionSize);
+        if (!buffer) {
+            queryBase += mbi.RegionSize;
+            continue;
+        }
+
         SIZE_T bytesRead = 0;
         if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer, mbi.RegionSize, &bytesRead)) {
             for (SIZE_T j = 0; j + 0x20 < bytesRead; ++j) {
                 if (*(buffer + j + 0x20) == 1) {
-                    LPVOID lpmem = nullptr;
-                    if (ReadProcessMemory(hProcess, (LPCVOID)((ULONG64)mbi.BaseAddress + j), &lpmem, sizeof(LPVOID), nullptr)) {
-                        if (lpmem == vtable) {
+                    LPVOID addr = nullptr;
+                    if (ReadProcessMemory(hProcess, (LPCVOID)((ULONG64)mbi.BaseAddress + j), 
+                                          &addr, sizeof(LPVOID), nullptr)) {
+                        ULONG64 addrValue = (ULONG64)addr;
+                        if (addrValue >= rdataInfo.startAddr && addrValue < rdataInfo.endAddr) {
                             LPVOID remoteStringPtr = nullptr;
-                            if (ReadProcessMemory(hProcess, (LPCVOID)((ULONG64)mbi.BaseAddress + j + 0x18), &remoteStringPtr, sizeof(LPVOID), nullptr)) {
-                                PrintRemoteUnicodeString(hProcess, (ULONG64)remoteStringPtr);
+                            LPVOID targetAddr = (LPVOID)((ULONG64)mbi.BaseAddress + j + 0x18);
+                            if (ReadProcessMemory(hProcess, targetAddr,&remoteStringPtr, sizeof(LPVOID), nullptr)) {
+                                LPVOID susAddr = nullptr;
+                                ReadProcessMemory(hProcess, remoteStringPtr, &susAddr, sizeof(LPVOID), nullptr);
+                                PBYTE susAddrByte = (PBYTE)&susAddr;
+                                if (susAddr != 0 && !((susAddrByte[5] = 0x7f && susAddrByte[6] == 0x00 && susAddrByte[7] == 0x00))) {
+                                    PrintRemoteUnicodeString(hProcess, (ULONG64)remoteStringPtr);
+                                }
                             }
                         }
                     }
